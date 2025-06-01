@@ -1,0 +1,10 @@
+{
+  "id": "em-dasher",
+  "name": "Em Dasher",
+  "version": "1.0.0",
+  "minAppVersion": "0.12.0",
+  "description": "Automatically converts two hyphens (--) into an em dash (—). Just type two hyphens followed by a space.",
+  "author": "Paul Stamatiou",
+  "authorUrl": "https://paulstamatiou.com",
+  "isDesktopOnly": false
+}
