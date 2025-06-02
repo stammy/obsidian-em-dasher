@@ -28,6 +28,10 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
+function editorHasCm5(editor) {
+  const cm = editor.cm;
+  return typeof cm === "object" && cm !== null && typeof cm.getTokenAt === "function";
+}
 var EmDasherPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
@@ -78,46 +82,66 @@ var EmDasherPlugin = class extends import_obsidian.Plugin {
     this.app.workspace.off("editor-change", this.handleEditorChange);
   }
   isInsideCodeBlock(editor, cursorPos) {
-    const cmEditor = editor.cm;
-    if (!cmEditor || !cmEditor.getModeAt)
-      return false;
     for (let i = Math.max(0, cursorPos.line - 10); i <= cursorPos.line; i++) {
       const lineText = editor.getLine(i);
       if (lineText.trim().startsWith("```")) {
         let inBlock = false;
-        for (let j = 0; j <= cursorPos.line; j++) {
-          if (editor.getLine(j).trim().startsWith("```"))
+        for (let j = 0; j < i; j++) {
+          if (editor.getLine(j).trim().startsWith("```")) {
             inBlock = !inBlock;
-        }
-        if (inBlock || editor.getLine(cursorPos.line).trim().startsWith("```") && cursorPos.ch > editor.getLine(cursorPos.line).indexOf("```")) {
-          for (let k = cursorPos.line; k < editor.lineCount(); k++) {
-            if (editor.getLine(k).includes("```", k === cursorPos.line ? cursorPos.ch : 0))
-              return true;
           }
-          if (inBlock)
-            return true;
+        }
+        if (editor.getLine(i).trim().startsWith("```")) {
+          inBlock = !inBlock;
+        }
+        if (inBlock) {
+          let blockStillOpen = true;
+          for (let k = i + 1; k <= cursorPos.line; k++) {
+            if (editor.getLine(k).trim().startsWith("```")) {
+              blockStillOpen = false;
+              if (k === cursorPos.line && editor.getLine(k).indexOf("```") > cursorPos.ch) {
+                blockStillOpen = true;
+              }
+            }
+          }
+          if (blockStillOpen && cursorPos.line >= i) {
+            if (cursorPos.line === i && // cursorPos.ch is the second dash. indexOf("```") + 2 is end of ```
+            cursorPos.ch <= editor.getLine(i).indexOf("```") + 2) {
+            } else {
+              return true;
+            }
+          }
         }
       }
     }
-    const token = cmEditor.getTokenAt(cursorPos, true);
-    if (token && token.type && token.type.includes("code") && token.type.includes("inline")) {
-      const lineContent = editor.getLine(cursorPos.line);
-      const dashStartIndex = cursorPos.ch - 2;
-      if (dashStartIndex >= token.start && cursorPos.ch <= token.end) {
-        if (lineContent.substring(token.start, token.end).includes("--")) {
+    if (editor.getLine(cursorPos.line).trim().startsWith("```") && cursorPos.ch > editor.getLine(cursorPos.line).indexOf("```")) {
+      let openFences = 0;
+      for (let l = 0; l <= cursorPos.line; l++) {
+        if (editor.getLine(l).trim().startsWith("```")) {
+          openFences++;
+        }
+      }
+      if (openFences % 2 !== 0)
+        return true;
+    }
+    if (editorHasCm5(editor)) {
+      const cm5Editor = editor.cm;
+      const tokenAtSecondDash = cm5Editor.getTokenAt(cursorPos, true);
+      if (tokenAtSecondDash && tokenAtSecondDash.type && tokenAtSecondDash.type.includes("code") && tokenAtSecondDash.type.includes("inline")) {
+        if (tokenAtSecondDash.start <= cursorPos.ch - 1) {
           return true;
         }
       }
     }
     const currentLine = editor.getLine(cursorPos.line);
     let backtickCount = 0;
-    for (let i = 0; i < cursorPos.ch - 2; i++) {
+    for (let i = 0; i < cursorPos.ch - 1; i++) {
       if (currentLine[i] === "`") {
         backtickCount++;
       }
     }
     if (backtickCount % 2 !== 0) {
-      if (currentLine.substring(cursorPos.ch).includes("`")) {
+      if (currentLine.substring(cursorPos.ch + 1).includes("`")) {
         return true;
       }
     }

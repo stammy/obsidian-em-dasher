@@ -1,5 +1,25 @@
 import { Plugin, Editor, MarkdownView, EditorPosition } from "obsidian";
 
+interface CM5Editor {
+  getTokenAt(pos: EditorPosition, precise?: boolean): CM5Token | null;
+}
+
+interface CM5Token {
+  start: number;
+  end: number;
+  string: string;
+  type: string | null;
+}
+
+function editorHasCm5(editor: Editor): editor is Editor & { cm: CM5Editor } {
+  const cm = (editor as { cm?: unknown }).cm;
+  return (
+    typeof cm === "object" &&
+    cm !== null &&
+    typeof (cm as CM5Editor).getTokenAt === "function"
+  );
+}
+
 export default class EmDasherPlugin extends Plugin {
   async onload() {
     this.app.workspace.on("editor-change", this.handleEditorChange);
@@ -26,18 +46,17 @@ export default class EmDasherPlugin extends Plugin {
       // Condition 2: The two characters before the space were "--".
       if (twoCharsBefore === "--") {
         // Condition 3: Ensure we are not converting part of "--- " or "---- ", etc.
-        // This means the character before the "--" pair (if it exists) was not a hyphen.
         const charBeforePairIndex = cursorPos.ch - 4;
         if (
           charBeforePairIndex < 0 ||
           line.charAt(charBeforePairIndex) !== "-"
         ) {
-          // Determine the correct position to check for code block/URL context.
-          // This should be around the actual "--" sequence.
+          // contextCheckPos is the position of the *second dash* of the "--" sequence
+          // because outer cursorPos is the space. So cursorPos.ch - 1 is the second dash.
           const contextCheckPos: EditorPosition = {
             line: cursorPos.line,
             ch: cursorPos.ch - 1,
-          }; // Position of the last char of "-- " (the space)
+          };
           const textContextBeforeDash = line.substring(0, cursorPos.ch - 3); // Text before "--"
           const contextPosBeforeDash: EditorPosition = {
             line: cursorPos.line,
@@ -64,72 +83,105 @@ export default class EmDasherPlugin extends Plugin {
   };
 
   isInsideCodeBlock(editor: Editor, cursorPos: EditorPosition): boolean {
-    const cmEditor = (editor as any).cm;
-    if (!cmEditor || !cmEditor.getModeAt) return false;
+    // cursorPos for this function is the position of the *second dash* of the "--" sequence.
 
-    // Check current line and line above for start of a fenced code block
+    // Check for fenced code blocks (``` ... ```)
+    // This logic uses editor.getLine() and string searches, generally CM-agnostic.
+    // Iterate from a few lines above to current line to find start of a block
     for (let i = Math.max(0, cursorPos.line - 10); i <= cursorPos.line; i++) {
-      // Check recent lines for performance
       const lineText = editor.getLine(i);
       if (lineText.trim().startsWith("```")) {
-        // if a block starts here or on a previous line and cursor is within
+        // Found a potential start of a code block. Now check if we're inside it.
         let inBlock = false;
-        for (let j = 0; j <= cursorPos.line; j++) {
-          if (editor.getLine(j).trim().startsWith("```")) inBlock = !inBlock;
-        }
-        if (
-          inBlock ||
-          (editor.getLine(cursorPos.line).trim().startsWith("```") &&
-            cursorPos.ch > editor.getLine(cursorPos.line).indexOf("```"))
-        ) {
-          // Now check for closing fence
-          for (let k = cursorPos.line; k < editor.lineCount(); k++) {
-            if (
-              editor
-                .getLine(k)
-                .includes("```", k === cursorPos.line ? cursorPos.ch : 0)
-            )
-              return true;
+        // Count ``` occurrences from top to current line i to determine if i is inside a block
+        for (let j = 0; j < i; j++) {
+          if (editor.getLine(j).trim().startsWith("```")) {
+            inBlock = !inBlock;
           }
-          // If no closing fence is found after the cursor in an opened block, it is considered inside.
-          if (inBlock) return true;
+        }
+        // If line i starts a block, then we are inside if currently on line i or after
+        if (editor.getLine(i).trim().startsWith("```")) {
+          inBlock = !inBlock; // Toggle for the current line's own ```
+        }
+
+        if (inBlock) {
+          let blockStillOpen = true;
+          for (let k = i + 1; k <= cursorPos.line; k++) {
+            if (editor.getLine(k).trim().startsWith("```")) {
+              blockStillOpen = false;
+              if (
+                k === cursorPos.line &&
+                editor.getLine(k).indexOf("```") > cursorPos.ch // cursor is after the second dash
+              ) {
+                blockStillOpen = true;
+              }
+            }
+          }
+          if (blockStillOpen && cursorPos.line >= i) {
+            if (
+              cursorPos.line === i &&
+              // cursorPos.ch is the second dash. indexOf("```") + 2 is end of ```
+              cursorPos.ch <= editor.getLine(i).indexOf("```") + 2
+            ) {
+              // Cursor is on the opening ``` line but at or before the ``` characters.
+            } else {
+              return true; // Inside a fenced block started on line i
+            }
+          }
         }
       }
     }
-
-    // Check for inline code using CodeMirror tokens if possible
-    // This is more reliable than manually parsing backticks
-    const token = cmEditor.getTokenAt(cursorPos, true);
+    // If on a line that starts with ``` and cursor (second dash) is after it
     if (
-      token &&
-      token.type &&
-      token.type.includes("code") &&
-      token.type.includes("inline")
+      editor.getLine(cursorPos.line).trim().startsWith("```") &&
+      cursorPos.ch > editor.getLine(cursorPos.line).indexOf("```")
     ) {
-      // Check if the '--' is within the bounds of this inline code token
-      const lineContent = editor.getLine(cursorPos.line);
-      const dashStartIndex = cursorPos.ch - 2;
-      if (dashStartIndex >= token.start && cursorPos.ch <= token.end) {
-        // check if the actual characters -- are within the token range that is marked as code
-        if (lineContent.substring(token.start, token.end).includes("--")) {
-          return true;
+      let openFences = 0;
+      for (let l = 0; l <= cursorPos.line; l++) {
+        if (editor.getLine(l).trim().startsWith("```")) {
+          openFences++;
+        }
+      }
+      if (openFences % 2 !== 0) return true; // Odd number of fences up to current line means we are inside.
+    }
+
+    // Check for inline code (e.g., `code`) using CodeMirror 5 API
+    if (editorHasCm5(editor)) {
+      const cm5Editor = editor.cm;
+      // cursorPos.ch is the position of the *second dash* of "--"
+      // We need to get the token at the second dash
+      const tokenAtSecondDash = cm5Editor.getTokenAt(cursorPos, true);
+
+      if (
+        tokenAtSecondDash &&
+        tokenAtSecondDash.type &&
+        tokenAtSecondDash.type.includes("code") &&
+        tokenAtSecondDash.type.includes("inline")
+      ) {
+        // Check if this token also covers the *first dash* (which is at cursorPos.ch - 1)
+        // token.start is inclusive column
+        if (tokenAtSecondDash.start <= cursorPos.ch - 1) {
+          return true; // Both dashes are covered by this inline code token
         }
       }
     }
-
-    // Fallback for inline code (if token check is not sufficient or fails)
+    // Fallback: Check for unclosed backticks on the current line before the "--"
+    // cursorPos.ch is the position of the second dash.
+    // We need to count backticks before the *first dash*, which is at (cursorPos.ch - 1).
     const currentLine = editor.getLine(cursorPos.line);
     let backtickCount = 0;
-    for (let i = 0; i < cursorPos.ch - 2; i++) {
-      // Count backticks before the potential '--'
+    for (let i = 0; i < cursorPos.ch - 1; i++) {
+      // Iterate up to char before the first dash
       if (currentLine[i] === "`") {
         backtickCount++;
       }
     }
-    // If an odd number of backticks appear before, it means we're inside an inline code block
+
     if (backtickCount % 2 !== 0) {
-      // Check if there is a closing backtick after the cursor
-      if (currentLine.substring(cursorPos.ch).includes("`")) {
+      // Odd number of backticks before "--" means we might be inside `...--
+      // Now check if there's a closing backtick *after* the second dash (cursorPos.ch)
+      if (currentLine.substring(cursorPos.ch + 1).includes("`")) {
+        // Check after the second dash
         return true;
       }
     }
